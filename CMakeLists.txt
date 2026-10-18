@@ -78,7 +78,7 @@ message(STATUS "radiance-exl3: device rows ${RAD_HIP_FOUND}, GPU targets '${RAD_
 
 enable_testing()
 foreach(_exl3_dir common quantizers/exl3 kernels/exl3ref kernels/exl3r4d
-                  architectures/qwen4exp_exl3 tools tests)
+                  architectures/qwen4exp_exl3 architectures/kolibri1_exl3 tools tests)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_exl3_dir}/CMakeLists.txt")
     add_subdirectory(${_exl3_dir})
   endif()

@@ -483,6 +483,12 @@ struct MoeEXL3 {
          * units a routed GEMM's tail leaves idle. */
         int64_t shared_lo = 0, shared_hi = 0;
         int     norm_topk    = 1;   /* renormalise the kept routing weights to sum to one */
+        /* THE SIGMOID ROUTER WITH A SELECTION BIAS (Kolibri, DeepSeek-V3) in place of the softmax:
+         * the router writes F32 logits (`logits_gemm`, so `Wire::logits` is f32), the top_k are
+         * chosen on `logit + bias` and weighted by `sigmoid(logit)` -- `router_sigmoid_topk`,
+         * with `Src::router_bias` its bias. The fused router forms are softmax routers and are not
+         * declared. 0 for every qwen4exp layer. */
+        int     route_sigmoid = 0;
         /* THE fp8 BLOCK'S STORED-FORMAT FLAGS ARE GONE: every routed expert this block serves is
          * EXL3 (or a protected plain bf16 one), which probe() checks and declare() checks again
          * expert by expert -- one table of experts takes one encoding.
@@ -570,6 +576,10 @@ struct MoeEXL3 {
         const char* experts_gate_up = nullptr;
         const char* experts_down    = nullptr;
         const char* shared_gate = nullptr;   /* mlp.shared_expert_gate.weight, [1, n_embd] */
+        /* The selection bias of a `route_sigmoid` router, [n_expert] -- one a router column -- and
+         * the name it is declared under (`blk.<l>.ffn_gate_inp.bias` when null). */
+        const char* router_bias      = nullptr;
+        const char* router_bias_decl = nullptr;
     };
 
     Geom   g{};
@@ -577,7 +587,11 @@ struct MoeEXL3 {
     Wire   w{};
     int    layer = 0;
 
-    rad_weight w_norm = 0, w_router = 0, w_sgate = 0;
+    rad_weight w_norm = 0, w_router = 0, w_sgate = 0, w_rbias = 0;
+    /* A SHARED EXPERT WITH NO GATE (Kolibri's `shared_experts`, added as it is): `Src::shared`
+     * without `Src::shared_gate`. The gather still folds the arm in, under a gate of exactly one
+     * that `op_sgate` fills -- `act` "none" -- so the sum is the folded gather's, narrows included. */
+    bool       sgate_one = false;
     /* The input was normed and quantised by the caller; this block declares no norm. */
     bool       ext_in = false;
     /* The runs: one a plane, each split by parity, indexed [plane][place in the sort]. Only the
@@ -897,6 +911,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     /* A rank whose slice of the shared arm is empty (see Config) declares no arm, and the
      * all-reduce carries the others' share. */
     const bool shared = c.n_ff_shared > 0 && src.shared;
+    sgate_one = shared && !src.shared_gate;
     /* Whether `w.sgate` is excluded from buffer sharing; set with the shared arm and required by
      * the fused router's gate write (see there). */
     bool sgate_concurrent = false;
@@ -1018,6 +1033,31 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, fold ? w.h.x : w.x, w.h, g.n_embd,
                                   fold ? w.x : 0, 0, ar_in));
 
+    if (c.route_sigmoid) {
+        /* F32 LOGITS: the selection compares `logit + bias` across 384-odd experts, and a bf16
+         * logit would move the experts near the cut. `logits_gemm` is gemm_nt's arithmetic with
+         * an f32 output, the same op the vocabulary edge uses. */
+        if (!src.router_bias) {
+            fprintf(stderr, "radiance: layer %d: a sigmoid router needs its selection bias\n", l);
+            return RAD_E_INVAL;
+        }
+        const char* bn = src.router_bias_decl ? src.router_bias_decl
+                                              : nm.f("blk.%d.ffn_gate_inp.bias", l);
+        RAD_ARCH_TRY(map_copy(b, bn, src.router_bias));
+        w_rbias = decl_w(b, bn, RAD_F32, {c.n_expert_all}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                         grp_layer(l));
+        op_router = rw(b, RAD_OP(b, "logits_gemm",
+                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n_vocab", c.n_expert_all),
+                                     RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
+                          RAD_WEIGHTS(w_router)),
+                      {w.h.x}, {w.logits});
+        op_topk = rw(b, RAD_OP(b, "router_sigmoid_topk",
+                        RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n_expert", c.n_expert_all),
+                                   RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm_topk),
+                                   RAD_STR("dtype", g.dtype)),
+                        RAD_WEIGHTS(w_rbias)),
+                    {w.logits}, {w.ids, w.ew});
+    } else {
     op_router = rw(b, RAD_OP(b, "gemm_nt",
                       RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", c.n_expert_all),
                                  RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
@@ -1029,6 +1069,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
                 {w.logits}, {w.ids, w.ew});
+    }
     /* Protected experts are sorted last (`protect`); layers without them declare no protect
      * list, so it is the last parameter and cut off. */
     const int n_prot = prot_list ? 1 : 0;
@@ -1051,6 +1092,8 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * depend on it. */
     topk_scatter_rows = (int64_t)c.rows * c.top_k <= kMoeSortRows ? c.rows
                                                                    : kMoeSortRows / c.top_k;
+    /* The fused selection-and-sort is the softmax router's; a sigmoid router issues the pair. */
+    if (c.route_sigmoid) topk_scatter_rows = 0;
     /* Asked for only where a loaded library declares it: a CPU-only engine would refuse the
      * declare, and the two separate ops serve without it. */
     if (topk_scatter_rows > 0 && rad_op_declared(b, "router_topk_scatter")) {
@@ -1541,7 +1584,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         op_gather = RAD_OP(b, "moe_gather",
                            RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
                                       RAD_INT("top_k", c.top_k), RAD_STR("dtype", g.dtype),
-                                      RAD_STR("act", gfold ? "sigmoid" : "none")),
+                                      RAD_STR("act", gfold && !sgate_one ? "sigmoid" : "none")),
                            RAD_NOWEIGHTS);
         if (!op_gather) return RAD_E_INVAL;
         rad_op_reads (b, op_gather, grd, gfold ? 5 : 3);
@@ -1605,7 +1648,14 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                      c.shared_lo, c.shared_hi));
         /* The shared gate, replicated like the router so every rank computes the same gate. One
          * output column: the skinny GEMM kernel clamps its N tile rather than masking, so N = 1 is
-         * legal. */
+         * legal. An ungated arm (sgate_one) fills the gate with one instead. */
+        if (sgate_one) {
+            op_sgate = rw(b, RAD_OP(b, "fill",
+                             RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", 1),
+                                        RAD_STR("dtype", g.dtype), RAD_F64("value", 1.0)),
+                             RAD_NOWEIGHTS),
+                         {}, {w.sgate});
+        } else {
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ffn_gate_shexp.weight", l), src.shared_gate));
         w_sgate = decl_w(b, nm.f("blk.%d.ffn_gate_shexp.weight", l), RAD_BF16, {1, g.n_embd},
                          RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
@@ -1614,6 +1664,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                     RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
                          RAD_WEIGHTS(w_sgate)),
                      {w.h.x}, {w.sgate});
+        }
     }
 
     /* ---- The router GEMM and `router_topk_scatter` as one op, plus the shared gate when the
@@ -1748,7 +1799,9 @@ inline int MoeEXL3::declare_stage_off(RadBuilder* b) {
 inline void MoeEXL3::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
                               bool gate_done) const {
     /* `gate_done`: the fused router already wrote this pass's gate. */
-    if (!gate_done)
+    if (sgate_one)
+        RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.sgate, r0, rows, 1));
+    else if (!gate_done)
         RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_sgate),
                     brow_slice(w.sgate, r0, rows, 1));
     sh_gate_up.step(c_, w.h, w.sgu, T, r0, rows);
@@ -1823,6 +1876,11 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool 
     } else if (op_topk_scatter && rows <= topk_scatter_rows) {
         RAD_ISSUE_N(c_, op_topk_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
+                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
+    } else if (c.route_sigmoid) {
+        RAD_ISSUE_N(c_, op_topk, rows, brow_slice(w.logits, r0, rows, ne_all), RAD_W(w_rbias),
+                    brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k));
+        RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
     } else {
         RAD_ISSUE_N(c_, op_topk, rows, brow_slice(w.logits, r0, rows, ne_all),
